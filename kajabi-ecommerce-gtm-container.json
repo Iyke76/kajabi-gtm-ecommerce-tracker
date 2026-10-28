@@ -1,0 +1,468 @@
+{
+  "exportFormatVersion": 2,
+  "exportTime": "2026-10-28 22:00:00",
+  "containerVersion": {
+    "path": "accounts/0/containers/0/versions/0",
+    "accountId": "0",
+    "containerId": "0",
+    "containerVersionId": "0",
+    "container": {
+      "path": "accounts/0/containers/0",
+      "accountId": "0",
+      "containerId": "0",
+      "name": "Kajabi GTM Ecommerce Tracker v1.3.0",
+      "publicId": "GTM-XXXXXXX",
+      "usageContext": [
+        "WEB"
+      ],
+      "fingerprint": "0",
+      "tagManagerUrl": ""
+    },
+    "tag": [
+      {
+        "accountId": "0",
+        "containerId": "0",
+        "fingerprint": "0",
+        "tagId": "20",
+        "name": "Kajabi - Ecommerce Tracker (Custom HTML)",
+        "type": "html",
+        "parameter": [
+          {
+            "type": "TEMPLATE",
+            "key": "html",
+            "value": "<script>\n/*!\n * Kajabi GTM Ecommerce Tracker v1.3.0 (Kajabi -> GA4 ecommerce dataLayer)\n * https://github.com/Iyke76/kajabi-gtm-ecommerce-tracker  |  Docs: https://iyrexmedia.com/gtm-form-listeners/kajabi-checkout/\n * MIT License (c) 2026 Iyke Abel\n * Pushes GA4-format ecommerce events to window.dataLayer for any Kajabi offer checkout.\n *\n * Events: view_item_list, select_item (pages linking to offers)\n *         view_item, begin_checkout, apply_coupon, add_payment_info, purchase (checkouts)\n *\n * How it works: reads Kajabi's own checkout API responses (same-origin), not the page text.\n *   GET  /api/offers/{token}/checkout                 -> offer, price, currency, bumps\n *   GET  /api/offers/{token}/checkout/coupon/{code}   -> discount, due now\n *   POST /api/offers/{token}/checkout                 -> order_checkout_id (transaction_id)\n *   GET  /api/order_checkout/{id}/status              -> \"succeeded\" = purchase\n *\n * Health: pushes 'kajabi_ecom_error' if Kajabi's API stops looking the way this script expects.\n * Server backup (optional): set serverUrl to send each purchase to kajabi-capi-worker.js.\n *\n * Install: GTM Custom HTML tag, trigger \"Initialization - All Pages\" (or All Pages).\n * Written in ES5 so GTM's Custom HTML validator accepts it.\n */\n(function (w, d) {\n  'use strict';\n  if (w.__kjbEcom) return;\n  var VERSION = '1.3.0';\n  w.__kjbEcom = { version: VERSION };\n\n  /* ---------------- CONFIG ---------------- */\n  var CFG = {\n    debug: false,            // true = log every push to the console\n    brand: '',               // item_brand; empty = Kajabi site title\n    category: 'Kajabi Offer',// item_category\n    trackOfferLinks: true,   // view_item_list + select_item on pages that link to offers\n    maxListItems: 12,        // max offers fetched for view_item_list\n    // Customer data on purchase, for Google Ads Enhanced Conversions + Meta Advanced Matching.\n    //   'off'    = no PII in the dataLayer\n    //   'plain'  = normalized values (Google tag + Meta Pixel hash them before sending)\n    //   'hashed' = SHA-256 in the dataLayer (raw PII never enters the dataLayer; use for CAPI / sGTM)\n    userData: 'off',\n    pendingTtlMin: 120,      // how long an unconfirmed order is kept for recovery\n    healthEvents: true,      // push 'kajabi_ecom_error' when Kajabi's API looks different than expected\n    // Server-side backup (optional). Base URL of your kajabi-capi-worker, e.g. 'https://track.yourdomain.com'.\n    // Empty = off. Sends hashed customer data + click ids to YOUR server only, never to a third party.\n    serverUrl: '',\n    ga4MeasurementId: ''     // e.g. 'G-XXXXXXX'; lets the server hit join the buyer's GA4 session\n  };\n  // Optional override: define window.KJB_ECOM_CONFIG = { ... } before this script loads.\n  (function (o) { if (o && typeof o === 'object') for (var k in o) if (o.hasOwnProperty(k) && CFG.hasOwnProperty(k)) CFG[k] = o[k]; })(w.KJB_ECOM_CONFIG);\n\n  var dl = w.dataLayer = w.dataLayer || [];\n  var K_DONE = 'kjb_ecom_done', K_PEND = 'kjb_ecom_pending', K_LIST = 'kjb_ecom_list', K_UD = 'kjb_ecom_ud_',\n    K_SRV = 'kjb_ecom_srv_', K_BEACON = 'kjb_ecom_beacon';\n  var RX_PAGE = /\\/offers\\/([A-Za-z0-9]+)\\/checkout/;\n  var RX_LINK = /\\/(?:resource_redirect\\/)?offers\\/([A-Za-z0-9]+)/;\n  var RX_API_OFFER = /\\/api\\/offers\\/([A-Za-z0-9]+)\\/checkout(?:\\/coupon\\/([^\\/?#]+))?\\/?(?:[?#]|$)/;\n  var RX_API_STATUS = /\\/api\\/order_checkout\\/([^\\/?#]+)\\/status/;\n\n  var offers = {};   // token -> Promise(data|null)\n  var st = {};       // token -> { coupon, viewed, began }\n  var subs = {};     // order_checkout_id -> Promise(record)\n\n  /* ---------------- helpers ---------------- */\n  function log() { if (CFG.debug && w.console) console.log.apply(console, ['[kjb-ecom]'].concat([].slice.call(arguments))); }\n  function json(s) { try { return typeof s === 'string' ? JSON.parse(s) : s; } catch (e) { return null; } }\n  function ls(k, v) {\n    try {\n      if (arguments.length === 1) return JSON.parse(w.localStorage.getItem(k) || 'null');\n      if (v === null) w.localStorage.removeItem(k); else w.localStorage.setItem(k, JSON.stringify(v));\n    } catch (e) { return null; }\n  }\n  function ss(k, v) {\n    try {\n      if (arguments.length === 1) return JSON.parse(w.sessionStorage.getItem(k) || 'null');\n      w.sessionStorage.setItem(k, JSON.stringify(v));\n    } catch (e) { return null; }\n  }\n  function amt(cents, exp) { return Math.round(Number(cents || 0)) / Math.pow(10, exp == null ? 2 : exp); }\n  function trim(s) { return s ? String(s).replace(/\\s+/g, ' ').replace(/^\\s|\\s$/g, '') : ''; }\n  function state(t) { return st[t] || (st[t] = {}); }\n  function now() { return new Date().getTime(); }\n\n  /* ---------------- health events ---------------- */\n  var reported = {};\n  function health(type, detail, token) {\n    if (!CFG.healthEvents || reported[type]) return;   // once per type per page\n    reported[type] = 1;\n    dl.push({ event: 'kajabi_ecom_error', error_type: type, error_detail: String(detail || '').slice(0, 150),\n      kajabi_offer_token: token || undefined, kajabi_ecom_version: VERSION, page_path: location.pathname });\n    log('health', type, detail);\n  }\n\n  var lastEvents = [];\n  function push(event, ecommerce, extra) {\n    dl.push({ ecommerce: null });\n    var o = { event: event, ecommerce: ecommerce };\n    if (extra) for (var k in extra) if (extra.hasOwnProperty(k)) o[k] = extra[k];\n    dl.push(o);\n    lastEvents.push(event + (ecommerce && ecommerce.value != null ? ' (' + ecommerce.value + ' ' + (ecommerce.currency || '') + ')' : ''));\n    if (lastEvents.length > 10) lastEvents.shift();\n    log(event, o);\n  }\n\n  // Debug API: window.__kjbEcom.status() in the browser console\n  w.__kjbEcom.status = function () {\n    return { version: VERSION, config: { userData: CFG.userData, serverUrl: CFG.serverUrl, healthEvents: CFG.healthEvents,\n        trackOfferLinks: CFG.trackOfferLinks, debug: CFG.debug },\n      checkoutPage: RX_PAGE.test(location.pathname), offersSeen: Object.keys(offers),\n      pendingOrders: Object.keys(ls(K_PEND) || {}).length, healthErrors: Object.keys(reported), lastEvents: lastEvents.slice() };\n  };\n\n  function xget(url) {\n    return new Promise(function (res) {\n      var x = new XMLHttpRequest();\n      x.__kjbSkip = true;\n      x.open('GET', url, true);\n      x.setRequestHeader('Accept', 'application/json');\n      x.onload = function () { var j = json(x.responseText); res(x.status < 300 && j ? j.data : null); };\n      x.onerror = function () { res(null); };\n      x.send();\n    });\n  }\n\n  function getOffer(token) {\n    if (!offers[token]) offers[token] = xget('/api/offers/' + token + '/checkout').then(function (data) {\n      if (!data) health('offer_api_failed', 'GET /api/offers/' + token + '/checkout returned no data', token);\n      else if (!data.price || data.price.amount == null || !data.offer)\n        health('offer_api_shape', 'unexpected offer data; keys: ' + Object.keys(data).join(','), token);\n      return data;\n    });\n    return offers[token];\n  }\n\n  /* ---------------- item / ecommerce builders ---------------- */\n  function listCtx(token) {\n    var l = ss(K_LIST);\n    return l && l.token === token ? l : null;\n  }\n\n  function offerItem(token, data, qty) {\n    var p = data.price || {}, o = data.offer || {};\n    var it = {\n      item_id: token,\n      item_name: trim(o.title) || token,\n      item_brand: CFG.brand || (data.site && data.site.title) || undefined,\n      item_category: CFG.category,\n      item_variant: p.price_type || undefined,\n      price: amt(p.amount, p.exponent),\n      quantity: qty || 1,\n      kajabi_offer_id: o.id != null ? String(o.id) : undefined\n    };\n    var l = listCtx(token);\n    if (l) { it.item_list_name = l.name; it.index = l.index; }\n    return it;\n  }\n\n  function bumpItems(data, selected) {\n    var out = [], ids = {};\n    (selected || []).forEach(function (s) {\n      var id = s && typeof s === 'object' ? (s.id || s.order_bump_id || s.offer_id) : s;\n      if (id != null) ids[String(id)] = 1;\n    });\n    (data.order_bumps || []).forEach(function (b) {\n      if (!ids[String(b.id)] && !(b.offer && ids[String(b.offer.id)])) return;\n      var p = b.price || (b.offer && b.offer.price) || {};\n      var cents = p.amount != null ? p.amount : (b.amount != null ? b.amount : b.price_in_cents);\n      out.push({\n        item_id: String(b.offer_token || (b.offer && b.offer.token) || b.id),\n        item_name: trim(b.title || b.offer_title || (b.offer && b.offer.title)) || 'Order bump',\n        item_category: CFG.category,\n        item_variant: 'order_bump',\n        price: amt(cents, p.exponent),\n        quantity: 1,\n        _cents: Number(cents || 0)\n      });\n    });\n    return out;\n  }\n\n  // ctx: { qty, coupon (Kajabi coupon object), bumps (selected ids) }\n  function buildEcom(token, data, ctx) {\n    ctx = ctx || {};\n    var p = data.price || {}, exp = p.exponent, qty = Number(ctx.qty) || 1;\n    var item = offerItem(token, data, qty);\n    var gross = Number(p.amount || 0) * qty, due = gross, c = ctx.coupon;\n\n    if (c && c.coupon_code) {\n      var disc = Number(c.discount_amount || 0);\n      item.coupon = c.coupon_code;\n      if (disc) {\n        item.discount = amt(disc / qty, exp);\n        item.price = amt((gross - disc) / qty, exp);\n      }\n      due = c.due_now_amount != null ? Number(c.due_now_amount) : Math.max(gross - disc, 0);\n    }\n    if (p.free) { due = 0; item.price = 0; }\n\n    var items = [item];\n    bumpItems(data, ctx.bumps).forEach(function (b) { due += b._cents; delete b._cents; items.push(b); });\n\n    var e = { currency: p.currency || 'USD', value: amt(due, exp), items: items };\n    if (c && c.coupon_code) e.coupon = c.coupon_code;\n    return e;\n  }\n\n  /* ---------------- customer data (Enhanced Conversions / Advanced Matching) ---------------- */\n  var CC = { US: '1', CA: '1', JM: '1', BS: '1', BB: '1', TT: '1', PR: '1', GB: '44', IE: '353', NG: '234', GH: '233',\n    KE: '254', ZA: '27', AU: '61', NZ: '64', DE: '49', FR: '33', NL: '31', IN: '91', AE: '971' };\n  function norm(s) { return s == null ? '' : String(s).replace(/^\\s+|\\s+$/g, '').toLowerCase(); }\n  function e164(phone, country) {\n    var raw = String(phone || '').replace(/^\\s+|\\s+$/g, ''), dg = raw.replace(/\\D/g, '');\n    if (!dg) return '';\n    if (raw.charAt(0) === '+') return '+' + dg;\n    if (raw.indexOf('00') === 0) return '+' + dg.slice(2);\n    var cc = CC[String(country || '').toUpperCase()];\n    if (!cc) return '';                         // can't know the country code: don't guess\n    if (dg.charAt(0) === '0') dg = dg.slice(1); // drop national trunk 0\n    if (!(dg.indexOf(cc) === 0 && dg.length > 10)) dg = cc + dg;\n    return '+' + dg;\n  }\n  function sha256(s) {\n    if (!s) return Promise.resolve('');\n    if (!(w.crypto && w.crypto.subtle && w.TextEncoder)) return Promise.resolve('');\n    return w.crypto.subtle.digest('SHA-256', new w.TextEncoder().encode(s)).then(function (b) {\n      var a = new Uint8Array(b), h = '';\n      for (var i = 0; i < a.length; i++) h += ('0' + a[i].toString(16)).slice(-2);\n      return h;\n    });\n  }\n  function clean(o) {\n    for (var k in o) if (o.hasOwnProperty(k)) {\n      if (o[k] && typeof o[k] === 'object') { clean(o[k]); if (!Object.keys(o[k]).length) delete o[k]; }\n      else if (o[k] === '' || o[k] == null) delete o[k];\n    }\n    return o;\n  }\n\n  // Pull PII from the checkout POST body (falls back to the logged-in member).\n  function collectPII(body, data) {\n    var m = body.member || {}, x = body.extra_contact_information || {}, mem = (data && data.member) || {};\n    var full = trim(m.name || body.name || x.name || mem.name);\n    var sp = full ? full.split(' ') : [];\n    var country = String(x.address_country || m.address_country || '').toUpperCase();\n    var zip = norm(x.address_zip).replace(/\\s+/g, '');\n    return {\n      email: norm(m.email || body.email || mem.email),\n      phone: e164(m.phone_number || x.phone_number || body.phone_number || x.phone || m.phone, country),\n      first: norm(sp[0]),\n      last: norm(sp.slice(1).join(' ')),\n      street: norm(x.address_line_1),\n      city: norm(x.address_city),\n      region: norm(x.address_state),\n      zip: country === 'US' ? zip.slice(0, 5) : zip,\n      country: country.toLowerCase(),\n      external_id: mem.id != null ? String(mem.id) : ''\n    };\n  }\n\n  // -> Promise({ google: {...}, meta: {...} })\n  function buildUserData(p, mode) {\n    var metaPhone = p.phone.replace(/\\D/g, '');\n    if (mode !== 'hashed') {\n      return Promise.resolve({\n        google: clean({ email: p.email, phone_number: p.phone,\n          address: { first_name: p.first, last_name: p.last, street: p.street, city: p.city,\n            region: p.region, postal_code: p.zip, country: p.country } }),\n        meta: clean({ em: p.email, ph: metaPhone, fn: p.first, ln: p.last, ct: p.city.replace(/\\s+/g, ''),\n          st: p.region, zp: p.zip, country: p.country, external_id: p.external_id })\n      });\n    }\n    // Google: gmail/googlemail dots before @ are removed before hashing\n    var gEmail = p.email.replace(/^([^@]+)@(gmail|googlemail)\\.com$/, function (a, u, dom) { return u.replace(/\\./g, '') + '@' + dom + '.com'; });\n    return Promise.all([gEmail, p.phone, p.first, p.last, p.street,\n      p.email, metaPhone, p.city.replace(/\\s+/g, ''), p.region, p.zip, p.country, p.external_id].map(sha256))\n      .then(function (h) {\n        return {\n          google: clean({ sha256_email_address: h[0], sha256_phone_number: h[1],\n            address: { sha256_first_name: h[2], sha256_last_name: h[3], sha256_street: h[4],\n              city: p.city, region: p.region, postal_code: p.zip, country: p.country } }),\n          meta: clean({ em: h[5], ph: h[6], fn: h[2], ln: h[3], ct: h[7], st: h[8], zp: h[9], country: h[10], external_id: h[11] })\n        };\n      });\n  }\n\n  function testFlag(data) { return data && data.test_mode ? { kajabi_test_mode: true } : undefined; }\n\n  /* ---------------- checkout events ---------------- */\n  function viewCheckout(token, beginNow) {\n    getOffer(token).then(function (data) {\n      if (!data || !data.price) return;\n      var s = state(token);\n      if (!s.viewed) { s.viewed = 1; push('view_item', buildEcom(token, data), testFlag(data)); }\n      if (beginNow) begin(token);\n    });\n  }\n\n  function begin(token) {\n    var s = state(token);\n    if (s.began) return;\n    s.began = 1;\n    getOffer(token).then(function (data) {\n      if (data && data.price) push('begin_checkout', buildEcom(token, data, { coupon: s.coupon }), testFlag(data));\n    });\n  }\n\n  function onCoupon(token, coupon) {\n    state(token).coupon = coupon;\n    getOffer(token).then(function (data) {\n      if (!data || !data.price) return;\n      push('apply_coupon', buildEcom(token, data, { coupon: coupon }), testFlag(data));\n    });\n  }\n\n  function onSubmit(token, body, resp) {\n    body = body || {};\n    var id = resp && (resp.order_checkout_id || resp.id);\n    if (!id) health('submit_no_id', 'checkout POST response keys: ' + (resp ? Object.keys(resp).join(',') : 'none'), token);\n    var s = state(token);\n    var code = body.coupon_code;\n    var couponP = !code ? Promise.resolve(null)\n      : (s.coupon && s.coupon.coupon_code === code) ? Promise.resolve(s.coupon)\n      : xget('/api/offers/' + token + '/checkout/coupon/' + encodeURIComponent(code)).then(function (r) { return r && r.coupon; });\n\n    var p = Promise.all([getOffer(token), couponP]).then(function (r) {\n      var data = r[0];\n      if (!data || !data.price) return null;\n      var ecom = buildEcom(token, data, { qty: body.quantity, coupon: r[1], bumps: body.selected_order_bumps });\n      if (!s.began) { s.began = 1; push('begin_checkout', JSON.parse(JSON.stringify(ecom)), testFlag(data)); }\n      ecom.payment_type = ecom.value > 0 ? 'card' : 'free';\n      push('add_payment_info', JSON.parse(JSON.stringify(ecom)), testFlag(data));\n      var rec = { id: id, token: token, ecom: ecom, ts: now(), test: !!data.test_mode, status: 'pending' };\n      if (id) savePending(rec);\n      if (!id) return rec;\n      // PII lives in sessionStorage only (same tab, cleared once used), never localStorage\n      var pii = collectPII(body, data), tasks = [];\n      if (CFG.userData !== 'off') tasks.push(buildUserData(pii, CFG.userData).then(function (ud) { ss(K_UD + id, ud); }));\n      if (CFG.serverUrl) tasks.push(buildUserData(pii, 'hashed').then(function (ud) { ss(K_SRV + id, ud); }));\n      if ((CFG.userData === 'hashed' || CFG.serverUrl) && !(w.crypto && w.crypto.subtle))\n        health('hash_unavailable', 'crypto.subtle missing; hashed user data skipped', token);\n      return Promise.all(tasks).then(function () { return rec; }, function () { return rec; });\n    });\n    if (id) subs[id] = p;\n  }\n\n  /* ---------------- purchase (deduped, survives the redirect) ---------------- */\n  function pendings() { return ls(K_PEND) || {}; }\n  function savePending(rec) { var p = pendings(); p[rec.id] = rec; ls(K_PEND, p); }\n  function dropPending(id) { var p = pendings(); delete p[id]; ls(K_PEND, p); }\n  function isDone(id) { return (ls(K_DONE) || []).indexOf(id) > -1; }\n  function markDone(id) { var a = ls(K_DONE) || []; a.push(id); ls(K_DONE, a.slice(-50)); }\n\n  function firePurchase(rec) {\n    if (!rec || !rec.id || isDone(rec.id)) return;\n    beacon(rec);                                 // no-op if already sent or serverUrl empty\n    markDone(rec.id);\n    dropPending(rec.id);\n    var e = rec.ecom;\n    e.transaction_id = rec.id;\n    var extra = { event_id: rec.id };            // use as Meta eventID for Pixel/CAPI dedup\n    if (rec.test) extra.kajabi_test_mode = true;\n    if (CFG.userData === 'off') { push('purchase', e, extra); return; }\n    var saved = ss(K_UD + rec.id);\n    try { w.sessionStorage.removeItem(K_UD + rec.id); } catch (x) {}\n\n    // Fallback: buyer is logged in after checkout, so Kajabi's API returns their email/name\n    var udP = saved ? Promise.resolve(saved) : getOffer(rec.token).then(function (data) {\n      var p = data && data.member ? collectPII({}, data) : null;\n      return p && p.email ? buildUserData(p, CFG.userData) : null;\n    }, function () { return null; });\n\n    udP.then(function (ud) {\n      if (!ud) { log('purchase: no user data found'); push('purchase', e, extra); return; }\n      var cu = w.Kajabi && w.Kajabi.currentSiteUser;\n      var ext = ud.meta.external_id ? Promise.resolve(ud.meta.external_id)\n        : cu && (cu.id || cu.contactId) ? (CFG.userData === 'hashed' ? sha256(String(cu.id || cu.contactId)) : Promise.resolve(String(cu.id || cu.contactId)))\n        : Promise.resolve('');\n      return ext.then(function (id) {\n        if (id) ud.meta.external_id = id;\n        extra.user_data = ud.google;\n        extra.meta_user_data = ud.meta;\n        push('purchase', e, extra);\n      });\n    })['catch'](function () { push('purchase', e, extra); });\n  }\n\n  // Kajabi redirects ~milliseconds after \"succeeded\", too fast for tags to send.\n  // So: mark it succeeded, fire on this page only if we are still here after 1.5s,\n  // otherwise the next page load (thank-you page) fires it.\n  function onStatus(id, data) {\n    var status = data && data.status;\n    if (status === 'succeeded') {\n      (subs[id] || Promise.resolve(pendings()[id])).then(function (rec) {\n        if (!rec) { health('purchase_no_record', 'order ' + id + ' succeeded but checkout data was not captured'); return; }\n        rec.status = 'succeeded';\n        savePending(rec);\n        beacon(rec);                             // sendBeacon survives Kajabi's instant redirect\n        var leaving = false;\n        w.addEventListener('pagehide', function () { leaving = true; });\n        setTimeout(function () { if (!leaving) firePurchase(pendings()[id]); }, 1500);\n      });\n    } else if (status === 'failed' || status === 'error' || status === 'canceled') {\n      dropPending(id);\n    } else if (!/^(pending|processing|requires_action|requires_payment_method|created)$/.test(status || '')) {\n      health('status_unknown', 'order status: ' + status);\n    }\n  }\n\n  /* ---------------- server-side backup beacon ---------------- */\n  function cookie(n) {\n    var m = d.cookie.match(new RegExp('(?:^|; )' + n.replace(/([.$?*|{}()\\[\\]\\\\\\/+^])/g, '\\\\$1') + '=([^;]*)'));\n    return m ? decodeURIComponent(m[1]) : '';\n  }\n  function gaIds() {\n    var ga = cookie('_ga').split('.'), sc = '', sid = '';\n    if (CFG.ga4MeasurementId) sc = cookie('_ga_' + CFG.ga4MeasurementId.replace(/^G-/, ''));\n    else { var mm = d.cookie.match(/(?:^|; )_ga_[A-Z0-9]+=([^;]*)/); sc = mm ? mm[1] : ''; }\n    if (/^GS1\\./.test(sc)) sid = sc.split('.')[2] || '';\n    else if (/^GS2\\./.test(sc)) { var mt = (sc.split('.')[2] || '').match(/(?:^|\\$)s(\\d+)/); sid = mt ? mt[1] : ''; }\n    return { client_id: ga.length >= 4 ? ga[2] + '.' + ga[3] : '', session_id: sid };\n  }\n  function beacon(rec) {\n    if (!CFG.serverUrl || !rec || !rec.id) return;\n    var sent = ls(K_BEACON) || [];\n    if (sent.indexOf(rec.id) > -1) return;\n    var srv = ss(K_SRV + rec.id) || {}, ids = gaIds(), aw = cookie('_gcl_aw').split('.');\n    var ecom = JSON.parse(JSON.stringify(rec.ecom));\n    ecom.transaction_id = rec.id;\n    var body = JSON.stringify({\n      v: VERSION, event_id: rec.id, offer_token: rec.token,\n      offer_id: ecom.items && ecom.items[0] ? ecom.items[0].kajabi_offer_id : '',\n      ecommerce: ecom, test: !!rec.test, ts: now(),\n      user_meta: srv.meta || {}, user_google: srv.google || {},     // SHA-256 hashed only\n      client_id: ids.client_id, session_id: ids.session_id,\n      fbp: cookie('_fbp'), fbc: cookie('_fbc'), gclid: aw.length > 2 ? aw.slice(2).join('.') : '',\n      user_agent: navigator.userAgent, page_location: location.origin + location.pathname\n    });\n    var url = CFG.serverUrl.replace(/\\/$/, '') + '/browser', ok = false;\n    try { ok = !!(navigator.sendBeacon && navigator.sendBeacon(url, new Blob([body], { type: 'text/plain' }))); } catch (e) {}\n    if (!ok && w.fetch) {\n      try { w.fetch(url, { method: 'POST', body: body, keepalive: true, mode: 'no-cors', headers: { 'Content-Type': 'text/plain' } }); ok = true; } catch (e) {}\n    }\n    if (ok) { sent.push(rec.id); ls(K_BEACON, sent.slice(-50)); try { w.sessionStorage.removeItem(K_SRV + rec.id); } catch (x) {} }\n    else health('server_beacon_failed', url);\n  }\n\n  function recover() {\n    var p = pendings(), ttl = CFG.pendingTtlMin * 60000;\n    Object.keys(p).forEach(function (id) {\n      var rec = p[id];\n      if (!rec || isDone(id) || now() - rec.ts > ttl) { dropPending(id); return; }\n      if (rec.status === 'succeeded') { firePurchase(rec); return; }\n      xget('/api/order_checkout/' + encodeURIComponent(id) + '/status').then(function (s) {\n        if (s && s.status === 'succeeded') firePurchase(pendings()[id]);\n        else if (s && /failed|error|canceled/.test(s.status)) dropPending(id);\n      });\n    });\n  }\n\n  /* ---------------- network hooks (XHR + fetch) ---------------- */\n  function onNet(method, url, body, status, text) {\n    if (!url || status < 200 || status >= 300) return;\n    var m = url.match(RX_API_OFFER), j;\n    method = String(method || 'GET').toUpperCase();\n    if (m) {\n      if (m[2] && method === 'GET') {\n        j = json(text);\n        if (j && j.data && j.data.coupon) onCoupon(m[1], j.data.coupon);\n      } else if (!m[2] && method === 'POST') {\n        j = json(text);\n        onSubmit(m[1], json(body), j && j.data);\n      }\n      return;\n    }\n    var s = url.match(RX_API_STATUS);\n    if (s) { j = json(text); if (j && j.data) onStatus(s[1], j.data); }\n  }\n\n  var XO = XMLHttpRequest.prototype.open, XS = XMLHttpRequest.prototype.send;\n  XMLHttpRequest.prototype.open = function (m, u) { this.__kjbM = m; this.__kjbU = String(u); return XO.apply(this, arguments); };\n  XMLHttpRequest.prototype.send = function (b) {\n    var x = this;\n    if (!x.__kjbSkip && /\\/api\\/(offers|order_checkout)\\//.test(x.__kjbU || '')) {\n      x.addEventListener('load', function () {\n        try { onNet(x.__kjbM, x.__kjbU, b, x.status, x.responseText); } catch (e) { log(e); health('script_exception', e && e.message); }\n      });\n    }\n    return XS.apply(this, arguments);\n  };\n\n  if (w.fetch) {\n    var F = w.fetch;\n    w.fetch = function (input, init) {\n      var url = String(typeof input === 'string' ? input : (input && input.url) || '');\n      var method = (init && init.method) || (input && input.method) || 'GET';\n      var body = init && init.body;\n      var r = F.apply(this, arguments);\n      if (/\\/api\\/(offers|order_checkout)\\//.test(url)) {\n        r.then(function (res) {\n          res.clone().text().then(function (t) {\n            try { onNet(method, url, typeof body === 'string' ? body : null, res.status, t); } catch (e) { log(e); health('script_exception', e && e.message); }\n          });\n        })['catch'](function () {});\n      }\n      return r;\n    };\n  }\n\n  /* ---------------- page scanning ---------------- */\n  function embeddedTokens() {\n    var out = [];\n    var els = d.querySelectorAll('[data-pages-embedded-checkout-react-mounter-props-value]');\n    for (var i = 0; i < els.length; i++) {\n      var props = json(els[i].getAttribute('data-pages-embedded-checkout-react-mounter-props-value'));\n      if (props && props.offer) out.push({ token: props.offer, el: els[i] });\n    }\n    return out;\n  }\n\n  function scanCheckouts() {\n    var pm = location.pathname.match(RX_PAGE);\n    if (pm) viewCheckout(pm[1], true); // dedicated checkout page: begin_checkout on load\n\n    embeddedTokens().forEach(function (e) {\n      if (pm && e.token === pm[1]) return;\n      if (e.el.__kjbBound) return;\n      e.el.__kjbBound = true;\n      viewCheckout(e.token, false);   // embedded on a sales page: begin on first interaction\n      var go = function () { begin(e.token); };\n      e.el.addEventListener('focusin', go, true);\n      e.el.addEventListener('click', go, true);\n    });\n  }\n\n  function scanLinks() {\n    if (!CFG.trackOfferLinks || RX_PAGE.test(location.pathname)) return;\n    var links = d.querySelectorAll('a[href*=\"/offers/\"]'), seen = {}, order = [];\n    for (var i = 0; i < links.length; i++) {\n      var m = (links[i].getAttribute('href') || '').match(RX_LINK);\n      if (m && !seen[m[1]]) { seen[m[1]] = 1; order.push(m[1]); }\n    }\n    order = order.slice(0, CFG.maxListItems);\n    if (!order.length) return;\n    var listName = trim(d.title) || location.pathname;\n\n    Promise.all(order.map(getOffer)).then(function (all) {\n      var items = [], cur = 'USD';\n      all.forEach(function (data, i) {\n        if (!data || !data.price) return;\n        var it = offerItem(order[i], data, 1);\n        it.index = i; it.item_list_name = listName;\n        cur = data.price.currency || cur;\n        items.push(it);\n      });\n      if (items.length) push('view_item_list', { item_list_id: location.pathname, item_list_name: listName, currency: cur, items: items });\n    });\n\n    d.addEventListener('click', function (ev) {\n      var a = ev.target && ev.target.closest ? ev.target.closest('a[href*=\"/offers/\"]') : null;\n      if (!a) return;\n      var m = (a.getAttribute('href') || '').match(RX_LINK);\n      if (!m) return;\n      var idx = order.indexOf(m[1]);\n      ss(K_LIST, { token: m[1], name: listName, index: idx > -1 ? idx : undefined });\n      var p = offers[m[1]];\n      var send = function (data) {\n        var it = data && data.price ? offerItem(m[1], data, 1) : { item_id: m[1], item_name: trim(a.innerText) || m[1] };\n        it.item_list_name = listName; if (idx > -1) it.index = idx;\n        var e = { item_list_id: location.pathname, item_list_name: listName, items: [it] };\n        if (data && data.price) { e.currency = data.price.currency; e.value = it.price; }\n        push('select_item', e);\n      };\n      if (p) p.then(send); else send(null);\n    }, true);\n  }\n\n  function init() {\n    recover();\n    scanCheckouts();\n    scanLinks();\n    if (w.MutationObserver) {\n      var t;\n      new MutationObserver(function () { clearTimeout(t); t = setTimeout(scanCheckouts, 300); })\n        .observe(d.documentElement, { childList: true, subtree: true });\n    }\n  }\n\n  if (d.readyState === 'loading') d.addEventListener('DOMContentLoaded', init); else init();\n})(window, document);\n</script>\n"
+          },
+          {
+            "type": "BOOLEAN",
+            "key": "supportDocumentWrite",
+            "value": "false"
+          }
+        ],
+        "firingTriggerId": [
+          "2147479573"
+        ],
+        "tagFiringOption": "ONCE_PER_LOAD",
+        "notes": "Initialization - All Pages. Edit the CONFIG block at the top (userData, serverUrl, ga4MeasurementId)."
+      },
+      {
+        "accountId": "0",
+        "containerId": "0",
+        "fingerprint": "0",
+        "tagId": "21",
+        "name": "GA4 - Kajabi ecommerce events",
+        "type": "gaawe",
+        "parameter": [
+          {
+            "type": "TEMPLATE",
+            "key": "eventName",
+            "value": "{{Event}}"
+          },
+          {
+            "type": "TEMPLATE",
+            "key": "measurementIdOverride",
+            "value": "{{Kajabi - GA4 Measurement ID}}"
+          },
+          {
+            "type": "BOOLEAN",
+            "key": "sendEcommerceData",
+            "value": "true"
+          },
+          {
+            "type": "TEMPLATE",
+            "key": "getEcommerceDataFrom",
+            "value": "dataLayer"
+          }
+        ],
+        "firingTriggerId": [
+          "11"
+        ],
+        "tagFiringOption": "ONCE_PER_EVENT",
+        "notes": "Sends the 7 GA4 ecommerce events with the items array. Do not add user_data here: GA4 terms prohibit PII in event parameters."
+      },
+      {
+        "accountId": "0",
+        "containerId": "0",
+        "fingerprint": "0",
+        "tagId": "22",
+        "name": "GA4 - kajabi_ecom_error",
+        "type": "gaawe",
+        "parameter": [
+          {
+            "type": "TEMPLATE",
+            "key": "eventName",
+            "value": "kajabi_ecom_error"
+          },
+          {
+            "type": "TEMPLATE",
+            "key": "measurementIdOverride",
+            "value": "{{Kajabi - GA4 Measurement ID}}"
+          },
+          {
+            "type": "BOOLEAN",
+            "key": "sendEcommerceData",
+            "value": "false"
+          },
+          {
+            "type": "LIST",
+            "key": "eventSettingsTable",
+            "list": [
+              {
+                "type": "MAP",
+                "map": [
+                  {
+                    "type": "TEMPLATE",
+                    "key": "parameter",
+                    "value": "error_type"
+                  },
+                  {
+                    "type": "TEMPLATE",
+                    "key": "parameterValue",
+                    "value": "{{DLV - error_type}}"
+                  }
+                ]
+              },
+              {
+                "type": "MAP",
+                "map": [
+                  {
+                    "type": "TEMPLATE",
+                    "key": "parameter",
+                    "value": "error_detail"
+                  },
+                  {
+                    "type": "TEMPLATE",
+                    "key": "parameterValue",
+                    "value": "{{DLV - error_detail}}"
+                  }
+                ]
+              },
+              {
+                "type": "MAP",
+                "map": [
+                  {
+                    "type": "TEMPLATE",
+                    "key": "parameter",
+                    "value": "kajabi_ecom_version"
+                  },
+                  {
+                    "type": "TEMPLATE",
+                    "key": "parameterValue",
+                    "value": "{{DLV - kajabi_ecom_version}}"
+                  }
+                ]
+              }
+            ]
+          }
+        ],
+        "firingTriggerId": [
+          "12"
+        ],
+        "tagFiringOption": "ONCE_PER_EVENT",
+        "notes": "Health event. Build a GA4 custom alert on any occurrence."
+      }
+    ],
+    "trigger": [
+      {
+        "accountId": "0",
+        "containerId": "0",
+        "fingerprint": "0",
+        "triggerId": "11",
+        "name": "CE - Kajabi ecommerce events",
+        "type": "CUSTOM_EVENT",
+        "customEventFilter": [
+          {
+            "type": "MATCH_REGEX",
+            "parameter": [
+              {
+                "type": "TEMPLATE",
+                "key": "arg0",
+                "value": "{{_event}}"
+              },
+              {
+                "type": "TEMPLATE",
+                "key": "arg1",
+                "value": "^(view_item_list|select_item|view_item|begin_checkout|apply_coupon|add_payment_info|purchase)$"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "accountId": "0",
+        "containerId": "0",
+        "fingerprint": "0",
+        "triggerId": "12",
+        "name": "CE - kajabi_ecom_error",
+        "type": "CUSTOM_EVENT",
+        "customEventFilter": [
+          {
+            "type": "EQUALS",
+            "parameter": [
+              {
+                "type": "TEMPLATE",
+                "key": "arg0",
+                "value": "{{_event}}"
+              },
+              {
+                "type": "TEMPLATE",
+                "key": "arg1",
+                "value": "kajabi_ecom_error"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "variable": [
+      {
+        "accountId": "0",
+        "containerId": "0",
+        "fingerprint": "0",
+        "variableId": "1",
+        "name": "Kajabi - GA4 Measurement ID",
+        "type": "c",
+        "parameter": [
+          {
+            "type": "TEMPLATE",
+            "key": "value",
+            "value": "G-XXXXXXXXXX"
+          }
+        ]
+      },
+      {
+        "accountId": "0",
+        "containerId": "0",
+        "fingerprint": "0",
+        "variableId": "2",
+        "name": "DLV - event_id",
+        "type": "v",
+        "parameter": [
+          {
+            "type": "INTEGER",
+            "key": "dataLayerVersion",
+            "value": "2"
+          },
+          {
+            "type": "BOOLEAN",
+            "key": "setDefaultValue",
+            "value": "false"
+          },
+          {
+            "type": "TEMPLATE",
+            "key": "name",
+            "value": "event_id"
+          }
+        ]
+      },
+      {
+        "accountId": "0",
+        "containerId": "0",
+        "fingerprint": "0",
+        "variableId": "3",
+        "name": "DLV - ecommerce.value",
+        "type": "v",
+        "parameter": [
+          {
+            "type": "INTEGER",
+            "key": "dataLayerVersion",
+            "value": "2"
+          },
+          {
+            "type": "BOOLEAN",
+            "key": "setDefaultValue",
+            "value": "false"
+          },
+          {
+            "type": "TEMPLATE",
+            "key": "name",
+            "value": "ecommerce.value"
+          }
+        ]
+      },
+      {
+        "accountId": "0",
+        "containerId": "0",
+        "fingerprint": "0",
+        "variableId": "4",
+        "name": "DLV - ecommerce.currency",
+        "type": "v",
+        "parameter": [
+          {
+            "type": "INTEGER",
+            "key": "dataLayerVersion",
+            "value": "2"
+          },
+          {
+            "type": "BOOLEAN",
+            "key": "setDefaultValue",
+            "value": "false"
+          },
+          {
+            "type": "TEMPLATE",
+            "key": "name",
+            "value": "ecommerce.currency"
+          }
+        ]
+      },
+      {
+        "accountId": "0",
+        "containerId": "0",
+        "fingerprint": "0",
+        "variableId": "5",
+        "name": "DLV - ecommerce.transaction_id",
+        "type": "v",
+        "parameter": [
+          {
+            "type": "INTEGER",
+            "key": "dataLayerVersion",
+            "value": "2"
+          },
+          {
+            "type": "BOOLEAN",
+            "key": "setDefaultValue",
+            "value": "false"
+          },
+          {
+            "type": "TEMPLATE",
+            "key": "name",
+            "value": "ecommerce.transaction_id"
+          }
+        ]
+      },
+      {
+        "accountId": "0",
+        "containerId": "0",
+        "fingerprint": "0",
+        "variableId": "6",
+        "name": "DLV - user_data",
+        "type": "v",
+        "parameter": [
+          {
+            "type": "INTEGER",
+            "key": "dataLayerVersion",
+            "value": "2"
+          },
+          {
+            "type": "BOOLEAN",
+            "key": "setDefaultValue",
+            "value": "false"
+          },
+          {
+            "type": "TEMPLATE",
+            "key": "name",
+            "value": "user_data"
+          }
+        ]
+      },
+      {
+        "accountId": "0",
+        "containerId": "0",
+        "fingerprint": "0",
+        "variableId": "7",
+        "name": "DLV - meta_user_data",
+        "type": "v",
+        "parameter": [
+          {
+            "type": "INTEGER",
+            "key": "dataLayerVersion",
+            "value": "2"
+          },
+          {
+            "type": "BOOLEAN",
+            "key": "setDefaultValue",
+            "value": "false"
+          },
+          {
+            "type": "TEMPLATE",
+            "key": "name",
+            "value": "meta_user_data"
+          }
+        ]
+      },
+      {
+        "accountId": "0",
+        "containerId": "0",
+        "fingerprint": "0",
+        "variableId": "8",
+        "name": "DLV - error_type",
+        "type": "v",
+        "parameter": [
+          {
+            "type": "INTEGER",
+            "key": "dataLayerVersion",
+            "value": "2"
+          },
+          {
+            "type": "BOOLEAN",
+            "key": "setDefaultValue",
+            "value": "false"
+          },
+          {
+            "type": "TEMPLATE",
+            "key": "name",
+            "value": "error_type"
+          }
+        ]
+      },
+      {
+        "accountId": "0",
+        "containerId": "0",
+        "fingerprint": "0",
+        "variableId": "9",
+        "name": "DLV - error_detail",
+        "type": "v",
+        "parameter": [
+          {
+            "type": "INTEGER",
+            "key": "dataLayerVersion",
+            "value": "2"
+          },
+          {
+            "type": "BOOLEAN",
+            "key": "setDefaultValue",
+            "value": "false"
+          },
+          {
+            "type": "TEMPLATE",
+            "key": "name",
+            "value": "error_detail"
+          }
+        ]
+      },
+      {
+        "accountId": "0",
+        "containerId": "0",
+        "fingerprint": "0",
+        "variableId": "10",
+        "name": "DLV - kajabi_ecom_version",
+        "type": "v",
+        "parameter": [
+          {
+            "type": "INTEGER",
+            "key": "dataLayerVersion",
+            "value": "2"
+          },
+          {
+            "type": "BOOLEAN",
+            "key": "setDefaultValue",
+            "value": "false"
+          },
+          {
+            "type": "TEMPLATE",
+            "key": "name",
+            "value": "kajabi_ecom_version"
+          }
+        ]
+      }
+    ],
+    "builtInVariable": [
+      {
+        "accountId": "0",
+        "containerId": "0",
+        "type": "EVENT",
+        "name": "Event"
+      }
+    ],
+    "fingerprint": "0"
+  }
+}
