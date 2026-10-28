@@ -1,0 +1,29 @@
+name = "kajabi-capi-worker"
+main = "index.js"
+compatibility_date = "2026-10-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "kajabi-capi"
+database_id = "REPLACE_WITH_ID_FROM_wrangler_d1_create"
+
+[vars]
+MODE = "beacon"                          # beacon | webhook
+ALLOWED_ORIGINS = "https://www.example.com"
+SITE_URL = "https://www.example.com"
+GA4_MEASUREMENT_ID = ""                  # e.g. G-XXXXXXX
+GA4_SEND = "fallback"                    # always | fallback | off
+GA4_USER_DATA = "false"                  # true only if GA4 user-provided data collection is on
+META_PIXEL_ID = ""
+META_API_VERSION = "v22.0"
+MATCH_WAIT_SEC = "15"
+SEND_RENEWALS = "false"
+ALLOW_TEST = "false"
+DEBUG = "false"
+DRY_RUN = "false"
+
+# Secrets (never in this file):
+#   npx wrangler secret put WEBHOOK_SECRET
+#   npx wrangler secret put META_ACCESS_TOKEN
+#   npx wrangler secret put GA4_API_SECRET
+#   npx wrangler secret put META_TEST_EVENT_CODE   (optional, while testing)
